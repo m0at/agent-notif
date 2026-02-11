@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 CONFIG_DIR="${HOME}/.config/agent-notif"
 CONFIG_FILE="${CONFIG_DIR}/config"
 AMAIL_SETTINGS="${HOME}/amail/settings.json"
@@ -17,20 +17,17 @@ declare -A SOURCE_EMOJI=(
   [test]="🧪"
 )
 
-# --- amail config reader (no jq dependency — uses python3) ---
+# --- amail config reader ---
 
 amail_get() {
   local key="$1"
   python3 -c "
-import json, sys
+import json
 with open('$AMAIL_SETTINGS') as f:
     cfg = json.load(f)
 d = cfg['domains'][0]
 keys = {
     'server_ip': d['server_ip'],
-    'ssh_key': d['ssh_key_path'],
-    'ssh_user': d['ssh_user'],
-    'ssh_port': str(d['ssh_port']),
     'domain': d['domain'],
     'from': d['email_accounts'][0]['address'],
     'to': d['email_accounts'][0]['address'],
@@ -50,12 +47,9 @@ load_config() {
   NOTIF_SOURCE="${NOTIF_SOURCE:-$(hostname -s 2>/dev/null || echo "unknown")}"
   NOTIF_TRANSPORT="${NOTIF_TRANSPORT:-email}"
 
-  # Email transport config (from amail)
+  # Email config (from amail)
   if [[ "$NOTIF_TRANSPORT" == "email" ]] && [[ -f "$AMAIL_SETTINGS" ]]; then
-    NOTIF_SSH_HOST="${NOTIF_SSH_HOST:-$(amail_get server_ip)}"
-    NOTIF_SSH_KEY="${NOTIF_SSH_KEY:-$(amail_get ssh_key)}"
-    NOTIF_SSH_USER="${NOTIF_SSH_USER:-$(amail_get ssh_user)}"
-    NOTIF_SSH_PORT="${NOTIF_SSH_PORT:-$(amail_get ssh_port)}"
+    NOTIF_SMTP_HOST="${NOTIF_SMTP_HOST:-$(amail_get server_ip)}"
     NOTIF_FROM="${NOTIF_FROM:-$(amail_get from)}"
     NOTIF_TO="${NOTIF_TO:-$(amail_get to)}"
   fi
@@ -73,10 +67,7 @@ NOTIF_SOURCE="$NOTIF_SOURCE"
 
 # Email transport (reads from amail settings.json by default)
 # Override here if needed:
-# NOTIF_SSH_HOST=""
-# NOTIF_SSH_KEY=""
-# NOTIF_SSH_USER=""
-# NOTIF_SSH_PORT=""
+# NOTIF_SMTP_HOST=""
 # NOTIF_FROM=""
 # NOTIF_TO=""
 
@@ -87,39 +78,28 @@ EOF
   chmod 600 "$CONFIG_FILE"
 }
 
-# --- Send via email (SSH → localhost SMTP) ---
+# --- Send via direct SMTP (python3, no SSH needed) ---
 
 send_email() {
   local subject="$1"
   local body="$2"
 
-  local py_script
-  py_script=$(cat <<PYEOF
+  python3 -c "
 import smtplib
 from email.mime.text import MIMEText
-from datetime import datetime
 
-msg = MIMEText("""${body}""")
-msg['From'] = "${NOTIF_FROM}"
-msg['To'] = "${NOTIF_TO}"
-msg['Subject'] = "${subject}"
-msg['X-Agent-Notif'] = "1"
+msg = MIMEText('''$body''')
+msg['From'] = '$NOTIF_FROM'
+msg['To'] = '$NOTIF_TO'
+msg['Subject'] = '$subject'
+msg['X-Agent-Notif'] = '1'
 
-with smtplib.SMTP('localhost', 25, timeout=10) as smtp:
+with smtplib.SMTP('$NOTIF_SMTP_HOST', 25, timeout=10) as smtp:
     smtp.send_message(msg)
-PYEOF
-)
-
-  ssh -q \
-    -i "$NOTIF_SSH_KEY" \
-    -p "$NOTIF_SSH_PORT" \
-    -o StrictHostKeyChecking=accept-new \
-    -o ConnectTimeout=5 \
-    "${NOTIF_SSH_USER}@${NOTIF_SSH_HOST}" \
-    "python3 -c $(printf '%q' "$py_script")" 2>/dev/null
+" 2>/dev/null
 }
 
-# --- Send via ntfy (HTTP POST, optional) ---
+# --- Send via ntfy (optional fallback) ---
 
 send_ntfy() {
   local title="$1"
@@ -135,31 +115,6 @@ send_ntfy() {
     "${NOTIF_SERVER}/${NOTIF_TOPIC}" 2>/dev/null
 }
 
-# --- QR Code ---
-
-print_qr_terminal() {
-  local data="$1"
-  if command -v qrencode &>/dev/null; then
-    qrencode -t ANSIUTF8 "$data"
-  elif command -v python3 &>/dev/null; then
-    python3 -c "
-import sys
-try:
-    import qrcode
-    qr = qrcode.QRCode(box_size=1, border=1)
-    qr.add_data(sys.argv[1])
-    qr.print_ascii(invert=True)
-except ImportError:
-    print('[QR] Install qrcode: pip3 install qrcode')
-    print(f'     Or install qrencode: brew install qrencode')
-    print(f'     URL: {sys.argv[1]}')
-" "$data"
-  else
-    echo "[No QR tool] brew install qrencode  OR  pip3 install qrcode"
-    echo "URL: $data"
-  fi
-}
-
 # --- Commands ---
 
 cmd_setup() {
@@ -169,15 +124,14 @@ cmd_setup() {
   echo "=== agent-notif setup ==="
   echo ""
 
-  # Check amail
   if [[ -f "$AMAIL_SETTINGS" ]]; then
     echo "Found amail config: $AMAIL_SETTINGS"
-    echo "  Server: ${NOTIF_SSH_HOST}"
-    echo "  From:   ${NOTIF_FROM}"
-    echo "  To:     ${NOTIF_TO}"
+    echo "  SMTP: ${NOTIF_SMTP_HOST}:25"
+    echo "  From: ${NOTIF_FROM}"
+    echo "  To:   ${NOTIF_TO}"
     echo ""
     NOTIF_TRANSPORT="email"
-    echo "Transport: email (via SSH → amail SMTP)"
+    echo "Transport: direct SMTP to amail server"
   else
     echo "No amail settings found at $AMAIL_SETTINGS"
     echo "Falling back to ntfy.sh transport"
@@ -208,9 +162,6 @@ cmd_setup() {
   else
     local url="${NOTIF_SERVER}/${NOTIF_TOPIC}"
     echo "Scan QR to subscribe in ntfy app:"
-    echo ""
-    print_qr_terminal "$url"
-    echo ""
     echo "URL: $url"
   fi
 
@@ -237,7 +188,6 @@ cmd_send() {
     esac
   done
 
-  # Read from stdin if no message argument
   if [[ -z "$message" ]]; then
     if [[ ! -t 0 ]]; then
       message=$(cat)
@@ -251,24 +201,23 @@ cmd_send() {
   local subject="[notif] ${emoji} ${source}: ${message}"
 
   if [[ "$NOTIF_TRANSPORT" == "email" ]]; then
-    if [[ -z "${NOTIF_SSH_HOST:-}" ]]; then
-      echo "Email transport not configured. Run: agent-notif setup" >&2
+    if [[ -z "${NOTIF_SMTP_HOST:-}" ]]; then
+      echo "Email not configured. Run: agent-notif setup" >&2
       return 1
     fi
 
-    local body
-    body="${message}
+    local body="${message}
 
 --
 source: ${source}
-host:   $(hostname -s 2>/dev/null || echo "unknown")
+host:   $(hostname -s 2>/dev/null || echo unknown)
 time:   $(date '+%Y-%m-%d %H:%M:%S %Z')
 pri:    ${priority}"
 
     if send_email "$subject" "$body"; then
       echo "Sent: ${emoji} ${message}"
     else
-      echo "Failed to send (SSH/SMTP error)" >&2
+      echo "Failed (SMTP error — is ${NOTIF_SMTP_HOST}:25 reachable?)" >&2
       return 1
     fi
 
@@ -280,7 +229,7 @@ pri:    ${priority}"
 
     local http_code
     http_code=$(send_ntfy "${emoji} ${source}" "$message" "$priority" "$source") || {
-      echo "Failed to send (network error)" >&2
+      echo "Failed (network error)" >&2
       return 1
     }
 
@@ -300,17 +249,12 @@ cmd_config() {
   echo "Config:    ${CONFIG_FILE}"
   echo ""
   if [[ "$NOTIF_TRANSPORT" == "email" ]]; then
-    echo "Email:"
-    echo "  SSH Host: ${NOTIF_SSH_HOST:-<not set>}"
-    echo "  SSH Port: ${NOTIF_SSH_PORT:-22}"
-    echo "  SSH User: ${NOTIF_SSH_USER:-<not set>}"
-    echo "  SSH Key:  ${NOTIF_SSH_KEY:-<not set>}"
-    echo "  From:     ${NOTIF_FROM:-<not set>}"
-    echo "  To:       ${NOTIF_TO:-<not set>}"
+    echo "SMTP: ${NOTIF_SMTP_HOST:-<not set>}:25"
+    echo "From: ${NOTIF_FROM:-<not set>}"
+    echo "To:   ${NOTIF_TO:-<not set>}"
   else
-    echo "ntfy:"
-    echo "  Server: ${NOTIF_SERVER}"
-    echo "  Topic:  ${NOTIF_TOPIC:-<not set>}"
+    echo "ntfy Server: ${NOTIF_SERVER}"
+    echo "ntfy Topic:  ${NOTIF_TOPIC:-<not set>}"
   fi
 }
 
@@ -323,8 +267,8 @@ cmd_usage() {
   cat <<EOF
 agent-notif v${VERSION} — Push notifications from any machine to iPhone
 
-Zero external APIs. Sends email via SSH to your amail server.
-iPhone gets notified via Mail VIP or Shortcuts automation.
+Zero APIs. Sends email direct to your amail SMTP server.
+iPhone notifies via Mail VIP or Shortcuts automation.
 
 Usage:
   agent-notif <command> [options]
@@ -346,14 +290,6 @@ Examples:
   notif -s claude -p high "Refactor complete: 47 files changed"
   notif -s aws "Deploy to prod finished"
   echo "Pipeline done" | notif -s lambda
-
-Transport:
-  Default: email via amail (SSH → localhost:25 SMTP)
-  Fallback: ntfy.sh (if no amail config found)
-
-Remote machines:
-  Copy your SSH key + set NOTIF_SSH_HOST, or just:
-  curl smtps://... (see docs/remote-setup.md)
 EOF
 }
 
@@ -370,7 +306,6 @@ main() {
     test)     cmd_test ;;
     help|--help|-h) cmd_usage ;;
     version|--version|-v) echo "agent-notif v${VERSION}" ;;
-    # If first arg isn't a command, treat it as a message (notif alias)
     *)        cmd_send "$cmd" "$@" ;;
   esac
 }
