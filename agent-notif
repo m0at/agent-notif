@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 CONFIG_DIR="${HOME}/.config/agent-notif"
 CONFIG_FILE="${CONFIG_DIR}/config"
-DEFAULT_SERVER="https://ntfy.sh"
+AMAIL_SETTINGS="${HOME}/amail/settings.json"
 
 # Source labels with emoji
 declare -A SOURCE_EMOJI=(
@@ -14,7 +14,30 @@ declare -A SOURCE_EMOJI=(
   [aws]="☁️"
   [do]="🌊"
   [lambda]="🧠"
+  [test]="🧪"
 )
+
+# --- amail config reader (no jq dependency — uses python3) ---
+
+amail_get() {
+  local key="$1"
+  python3 -c "
+import json, sys
+with open('$AMAIL_SETTINGS') as f:
+    cfg = json.load(f)
+d = cfg['domains'][0]
+keys = {
+    'server_ip': d['server_ip'],
+    'ssh_key': d['ssh_key_path'],
+    'ssh_user': d['ssh_user'],
+    'ssh_port': str(d['ssh_port']),
+    'domain': d['domain'],
+    'from': d['email_accounts'][0]['address'],
+    'to': d['email_accounts'][0]['address'],
+}
+print(keys.get('$key', ''))
+" 2>/dev/null
+}
 
 # --- Config ---
 
@@ -23,34 +46,93 @@ load_config() {
     # shellcheck source=/dev/null
     source "$CONFIG_FILE"
   fi
-  NOTIF_SERVER="${NOTIF_SERVER:-$DEFAULT_SERVER}"
-  NOTIF_TOPIC="${NOTIF_TOPIC:-}"
+
   NOTIF_SOURCE="${NOTIF_SOURCE:-$(hostname -s 2>/dev/null || echo "unknown")}"
-  NOTIF_PRIORITY="${NOTIF_PRIORITY:-default}"
+  NOTIF_TRANSPORT="${NOTIF_TRANSPORT:-email}"
+
+  # Email transport config (from amail)
+  if [[ "$NOTIF_TRANSPORT" == "email" ]] && [[ -f "$AMAIL_SETTINGS" ]]; then
+    NOTIF_SSH_HOST="${NOTIF_SSH_HOST:-$(amail_get server_ip)}"
+    NOTIF_SSH_KEY="${NOTIF_SSH_KEY:-$(amail_get ssh_key)}"
+    NOTIF_SSH_USER="${NOTIF_SSH_USER:-$(amail_get ssh_user)}"
+    NOTIF_SSH_PORT="${NOTIF_SSH_PORT:-$(amail_get ssh_port)}"
+    NOTIF_FROM="${NOTIF_FROM:-$(amail_get from)}"
+    NOTIF_TO="${NOTIF_TO:-$(amail_get to)}"
+  fi
+
+  # ntfy fallback
+  NOTIF_SERVER="${NOTIF_SERVER:-https://ntfy.sh}"
+  NOTIF_TOPIC="${NOTIF_TOPIC:-}"
 }
 
 save_config() {
   mkdir -p "$CONFIG_DIR"
   cat > "$CONFIG_FILE" <<EOF
+NOTIF_TRANSPORT="$NOTIF_TRANSPORT"
+NOTIF_SOURCE="$NOTIF_SOURCE"
+
+# Email transport (reads from amail settings.json by default)
+# Override here if needed:
+# NOTIF_SSH_HOST=""
+# NOTIF_SSH_KEY=""
+# NOTIF_SSH_USER=""
+# NOTIF_SSH_PORT=""
+# NOTIF_FROM=""
+# NOTIF_TO=""
+
+# ntfy transport (optional fallback)
 NOTIF_SERVER="$NOTIF_SERVER"
 NOTIF_TOPIC="$NOTIF_TOPIC"
-NOTIF_SOURCE="$NOTIF_SOURCE"
-NOTIF_PRIORITY="$NOTIF_PRIORITY"
 EOF
   chmod 600 "$CONFIG_FILE"
 }
 
-generate_topic() {
-  # Generate a random topic name that's hard to guess
-  local random
-  if command -v openssl &>/dev/null; then
-    random=$(openssl rand -hex 12)
-  elif [[ -r /dev/urandom ]]; then
-    random=$(head -c 12 /dev/urandom | xxd -p 2>/dev/null || od -An -tx1 /dev/urandom | head -1 | tr -d ' ')
-  else
-    random="$$-$(date +%s)-$RANDOM$RANDOM"
-  fi
-  echo "an-${random}"
+# --- Send via email (SSH → localhost SMTP) ---
+
+send_email() {
+  local subject="$1"
+  local body="$2"
+
+  local py_script
+  py_script=$(cat <<PYEOF
+import smtplib
+from email.mime.text import MIMEText
+from datetime import datetime
+
+msg = MIMEText("""${body}""")
+msg['From'] = "${NOTIF_FROM}"
+msg['To'] = "${NOTIF_TO}"
+msg['Subject'] = "${subject}"
+msg['X-Agent-Notif'] = "1"
+
+with smtplib.SMTP('localhost', 25, timeout=10) as smtp:
+    smtp.send_message(msg)
+PYEOF
+)
+
+  ssh -q \
+    -i "$NOTIF_SSH_KEY" \
+    -p "$NOTIF_SSH_PORT" \
+    -o StrictHostKeyChecking=accept-new \
+    -o ConnectTimeout=5 \
+    "${NOTIF_SSH_USER}@${NOTIF_SSH_HOST}" \
+    "python3 -c $(printf '%q' "$py_script")" 2>/dev/null
+}
+
+# --- Send via ntfy (HTTP POST, optional) ---
+
+send_ntfy() {
+  local title="$1"
+  local message="$2"
+  local priority="${3:-default}"
+  local tags="${4:-}"
+
+  curl -s -o /dev/null -w "%{http_code}" \
+    -H "Title: ${title}" \
+    -H "Priority: ${priority}" \
+    -H "Tags: ${tags}" \
+    -d "$message" \
+    "${NOTIF_SERVER}/${NOTIF_TOPIC}" 2>/dev/null
 }
 
 # --- QR Code ---
@@ -70,98 +152,68 @@ try:
 except ImportError:
     print('[QR] Install qrcode: pip3 install qrcode')
     print(f'     Or install qrencode: brew install qrencode')
-    print(f'     Manual URL: {sys.argv[1]}')
+    print(f'     URL: {sys.argv[1]}')
 " "$data"
   else
-    echo "[QR] No QR generator found."
-    echo "     Install: brew install qrencode"
-    echo "     Or: pip3 install qrcode"
-    echo ""
-    echo "     Manual URL: $data"
+    echo "[No QR tool] brew install qrencode  OR  pip3 install qrcode"
+    echo "URL: $data"
   fi
-}
-
-save_qr_png() {
-  local data="$1"
-  local outfile="$2"
-  if command -v qrencode &>/dev/null; then
-    qrencode -o "$outfile" -s 10 "$data"
-    return 0
-  elif command -v python3 &>/dev/null; then
-    python3 -c "
-import sys
-try:
-    import qrcode
-    img = qrcode.make(sys.argv[1])
-    img.save(sys.argv[2])
-except ImportError:
-    sys.exit(1)
-" "$data" "$outfile" && return 0
-  fi
-  return 1
 }
 
 # --- Commands ---
 
 cmd_setup() {
-  local server="$DEFAULT_SERVER"
-  local remote=false
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --server) server="$2"; shift 2 ;;
-      --remote) remote=true; shift ;;
-      *) shift ;;
-    esac
-  done
-
   load_config
-
-  if [[ -n "$NOTIF_TOPIC" ]] && [[ "$remote" == false ]]; then
-    echo "Already configured. Topic: $NOTIF_TOPIC"
-    echo "Server: $NOTIF_SERVER"
-    echo ""
-    read -rp "Regenerate topic? (y/N) " yn
-    if [[ "$yn" != [yY]* ]]; then
-      echo ""
-      echo "To show QR again: agent-notif qr"
-      return 0
-    fi
-  fi
-
-  NOTIF_SERVER="$server"
-  NOTIF_TOPIC="$(generate_topic)"
-  save_config
 
   echo ""
   echo "=== agent-notif setup ==="
   echo ""
-  echo "Topic:  $NOTIF_TOPIC"
-  echo "Server: $NOTIF_SERVER"
-  echo ""
 
-  local subscribe_url="${NOTIF_SERVER}/${NOTIF_TOPIC}"
-
-  echo "--- Scan this QR code to subscribe ---"
-  echo ""
-  print_qr_terminal "$subscribe_url"
-  echo ""
-
-  # Save PNG
-  local qr_png="${CONFIG_DIR}/subscribe-qr.png"
-  if save_qr_png "$subscribe_url" "$qr_png"; then
-    echo "QR saved to: $qr_png"
+  # Check amail
+  if [[ -f "$AMAIL_SETTINGS" ]]; then
+    echo "Found amail config: $AMAIL_SETTINGS"
+    echo "  Server: ${NOTIF_SSH_HOST}"
+    echo "  From:   ${NOTIF_FROM}"
+    echo "  To:     ${NOTIF_TO}"
+    echo ""
+    NOTIF_TRANSPORT="email"
+    echo "Transport: email (via SSH → amail SMTP)"
+  else
+    echo "No amail settings found at $AMAIL_SETTINGS"
+    echo "Falling back to ntfy.sh transport"
+    echo ""
+    NOTIF_TRANSPORT="ntfy"
+    if [[ -z "$NOTIF_TOPIC" ]]; then
+      local random
+      random=$(openssl rand -hex 12 2>/dev/null || echo "$$-$(date +%s)-$RANDOM")
+      NOTIF_TOPIC="an-${random}"
+    fi
   fi
 
+  save_config
+
   echo ""
-  echo "--- Setup options ---"
+  echo "--- iPhone setup ---"
   echo ""
-  echo "Option 1: ntfy.sh app (recommended)"
-  echo "  Install ntfy from App Store, then scan QR or open:"
-  echo "  $subscribe_url"
-  echo ""
-  echo "Option 2: iOS Shortcuts (no app needed)"
-  echo "  Run: agent-notif shortcut"
+
+  if [[ "$NOTIF_TRANSPORT" == "email" ]]; then
+    echo "1. On iPhone → Mail → mark ${NOTIF_FROM} as VIP"
+    echo "   (VIP emails get banner notifications + custom sound)"
+    echo ""
+    echo "2. OR: Shortcuts → Automation → Mail"
+    echo "   Trigger: Subject contains '[notif]'"
+    echo "   Action:  Show Notification"
+    echo ""
+    echo "That's it. Zero apps to install."
+  else
+    local url="${NOTIF_SERVER}/${NOTIF_TOPIC}"
+    echo "Scan QR to subscribe in ntfy app:"
+    echo ""
+    print_qr_terminal "$url"
+    echo ""
+    echo "URL: $url"
+  fi
+
   echo ""
   echo "--- Test it ---"
   echo ""
@@ -169,46 +221,17 @@ cmd_setup() {
   echo ""
 }
 
-cmd_qr() {
-  load_config
-  if [[ -z "$NOTIF_TOPIC" ]]; then
-    echo "Not configured yet. Run: agent-notif setup"
-    return 1
-  fi
-
-  local subscribe_url="${NOTIF_SERVER}/${NOTIF_TOPIC}"
-  echo ""
-  echo "Subscribe URL: $subscribe_url"
-  echo ""
-  print_qr_terminal "$subscribe_url"
-
-  local qr_png="${CONFIG_DIR}/subscribe-qr.png"
-  if save_qr_png "$subscribe_url" "$qr_png"; then
-    echo ""
-    echo "QR PNG: $qr_png"
-  fi
-}
-
 cmd_send() {
   load_config
 
-  if [[ -z "$NOTIF_TOPIC" ]]; then
-    echo "Not configured. Run: agent-notif setup" >&2
-    return 1
-  fi
-
   local message=""
   local source="$NOTIF_SOURCE"
-  local priority="$NOTIF_PRIORITY"
-  local title=""
-  local tags=""
+  local priority="default"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -s|--source) source="$2"; shift 2 ;;
       -p|--priority) priority="$2"; shift 2 ;;
-      -t|--title) title="$2"; shift 2 ;;
-      --tags) tags="$2"; shift 2 ;;
       -*) echo "Unknown flag: $1" >&2; return 1 ;;
       *) message="$1"; shift ;;
     esac
@@ -224,133 +247,113 @@ cmd_send() {
     fi
   fi
 
-  # Build title from source
   local emoji="${SOURCE_EMOJI[$source]:-📡}"
-  if [[ -z "$title" ]]; then
-    title="${emoji} ${source}"
+  local subject="[notif] ${emoji} ${source}: ${message}"
+
+  if [[ "$NOTIF_TRANSPORT" == "email" ]]; then
+    if [[ -z "${NOTIF_SSH_HOST:-}" ]]; then
+      echo "Email transport not configured. Run: agent-notif setup" >&2
+      return 1
+    fi
+
+    local body
+    body="${message}
+
+--
+source: ${source}
+host:   $(hostname -s 2>/dev/null || echo "unknown")
+time:   $(date '+%Y-%m-%d %H:%M:%S %Z')
+pri:    ${priority}"
+
+    if send_email "$subject" "$body"; then
+      echo "Sent: ${emoji} ${message}"
+    else
+      echo "Failed to send (SSH/SMTP error)" >&2
+      return 1
+    fi
+
+  elif [[ "$NOTIF_TRANSPORT" == "ntfy" ]]; then
+    if [[ -z "${NOTIF_TOPIC:-}" ]]; then
+      echo "ntfy not configured. Run: agent-notif setup" >&2
+      return 1
+    fi
+
+    local http_code
+    http_code=$(send_ntfy "${emoji} ${source}" "$message" "$priority" "$source") || {
+      echo "Failed to send (network error)" >&2
+      return 1
+    }
+
+    if [[ "$http_code" == "200" ]]; then
+      echo "Sent: ${emoji} ${message}"
+    else
+      echo "Failed (HTTP $http_code)" >&2
+      return 1
+    fi
   fi
-
-  # Build tag list
-  if [[ -z "$tags" ]]; then
-    tags="$source"
-  fi
-
-  # Send via curl
-  local -a curl_args=(
-    -s
-    -o /dev/null
-    -w "%{http_code}"
-    -H "Title: ${title}"
-    -H "Priority: ${priority}"
-    -H "Tags: ${tags}"
-    -d "$message"
-    "${NOTIF_SERVER}/${NOTIF_TOPIC}"
-  )
-
-  local http_code
-  http_code=$(curl "${curl_args[@]}" 2>/dev/null) || {
-    echo "Failed to send notification (network error)" >&2
-    return 1
-  }
-
-  if [[ "$http_code" == "200" ]]; then
-    echo "Sent: ${emoji} ${message}"
-  else
-    echo "Failed (HTTP $http_code)" >&2
-    return 1
-  fi
-}
-
-cmd_shortcut() {
-  load_config
-  if [[ -z "$NOTIF_TOPIC" ]]; then
-    echo "Not configured yet. Run: agent-notif setup"
-    return 1
-  fi
-
-  echo ""
-  echo "=== iOS Shortcuts Setup ==="
-  echo ""
-  echo "Since iOS Shortcuts can't directly listen for push notifications"
-  echo "from ntfy.sh, here are two approaches:"
-  echo ""
-  echo "--- Approach 1: ntfy.sh App (easiest) ---"
-  echo ""
-  echo "Just install 'ntfy' from the App Store and subscribe to:"
-  echo "  ${NOTIF_SERVER}/${NOTIF_TOPIC}"
-  echo ""
-  echo "--- Approach 2: Shortcuts Automation ---"
-  echo ""
-  echo "Create a Shortcut that checks for new messages:"
-  echo ""
-  echo "1. Open Shortcuts app"
-  echo "2. Create new Shortcut:"
-  echo "   - Action: 'Get Contents of URL'"
-  echo "     URL: ${NOTIF_SERVER}/${NOTIF_TOPIC}/json?poll=1&since=5m"
-  echo "   - Action: 'Get Dictionary Value' (key: 'message')"
-  echo "   - Action: 'Show Notification'"
-  echo "3. Set up Automation:"
-  echo "   - Trigger: 'Time of Day' → every 5 minutes"
-  echo "   - Action: Run your Shortcut"
-  echo ""
-  echo "--- Approach 3: Shortcuts + Focus Filter ---"
-  echo ""
-  echo "For instant notifications without polling:"
-  echo "1. Install ntfy app (for push delivery)"
-  echo "2. Create a Shortcut triggered by ntfy notification"
-  echo "3. The Shortcut can then log, filter, or forward notifications"
-  echo ""
-  echo "Topic for all methods: ${NOTIF_TOPIC}"
-  echo "Server: ${NOTIF_SERVER}"
-  echo ""
 }
 
 cmd_config() {
   load_config
-  echo "Server:   ${NOTIF_SERVER}"
-  echo "Topic:    ${NOTIF_TOPIC:-<not set>}"
-  echo "Source:   ${NOTIF_SOURCE}"
-  echo "Priority: ${NOTIF_PRIORITY}"
-  echo "Config:   ${CONFIG_FILE}"
+  echo "Transport: ${NOTIF_TRANSPORT}"
+  echo "Source:    ${NOTIF_SOURCE}"
+  echo "Config:    ${CONFIG_FILE}"
+  echo ""
+  if [[ "$NOTIF_TRANSPORT" == "email" ]]; then
+    echo "Email:"
+    echo "  SSH Host: ${NOTIF_SSH_HOST:-<not set>}"
+    echo "  SSH Port: ${NOTIF_SSH_PORT:-22}"
+    echo "  SSH User: ${NOTIF_SSH_USER:-<not set>}"
+    echo "  SSH Key:  ${NOTIF_SSH_KEY:-<not set>}"
+    echo "  From:     ${NOTIF_FROM:-<not set>}"
+    echo "  To:       ${NOTIF_TO:-<not set>}"
+  else
+    echo "ntfy:"
+    echo "  Server: ${NOTIF_SERVER}"
+    echo "  Topic:  ${NOTIF_TOPIC:-<not set>}"
+  fi
 }
 
 cmd_test() {
   load_config
-  if [[ -z "$NOTIF_TOPIC" ]]; then
-    echo "Not configured yet. Run: agent-notif setup"
-    return 1
-  fi
-  cmd_send -s "test" -p "default" "Test notification from $(hostname -s 2>/dev/null || echo "agent-notif") at $(date '+%H:%M:%S')"
+  cmd_send -s "test" "Test from $(hostname -s 2>/dev/null || echo "agent-notif") at $(date '+%H:%M:%S')"
 }
 
 cmd_usage() {
   cat <<EOF
 agent-notif v${VERSION} — Push notifications from any machine to iPhone
 
+Zero external APIs. Sends email via SSH to your amail server.
+iPhone gets notified via Mail VIP or Shortcuts automation.
+
 Usage:
   agent-notif <command> [options]
   notif [options] "message"          (shorthand for send)
 
 Commands:
-  setup [--server URL] [--remote]    First-time setup, generates QR
+  setup                              First-time setup (auto-detects amail)
   send  [-s source] [-p pri] "msg"   Send a notification
-  qr                                 Show subscribe QR code again
-  shortcut                           iOS Shortcut setup instructions
   config                             Show current configuration
   test                               Send a test notification
   help                               Show this help
 
 Send options:
   -s, --source NAME    Source label (home|laptop|claude|aws|do|lambda|custom)
-  -p, --priority PRI   Priority (min|low|default|high|max)
-  -t, --title TEXT     Custom title (default: source name)
-  --tags TAGS          Comma-separated tags
+  -p, --priority PRI   Priority (low|default|high)
 
 Examples:
   notif "Build done"
   notif -s claude -p high "Refactor complete: 47 files changed"
   notif -s aws "Deploy to prod finished"
   echo "Pipeline done" | notif -s lambda
+
+Transport:
+  Default: email via amail (SSH → localhost:25 SMTP)
+  Fallback: ntfy.sh (if no amail config found)
+
+Remote machines:
+  Copy your SSH key + set NOTIF_SSH_HOST, or just:
+  curl smtps://... (see docs/remote-setup.md)
 EOF
 }
 
@@ -363,8 +366,6 @@ main() {
   case "$cmd" in
     setup)    cmd_setup "$@" ;;
     send)     cmd_send "$@" ;;
-    qr)       cmd_qr ;;
-    shortcut) cmd_shortcut ;;
     config)   cmd_config ;;
     test)     cmd_test ;;
     help|--help|-h) cmd_usage ;;

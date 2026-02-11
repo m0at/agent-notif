@@ -1,82 +1,83 @@
-# iOS Shortcuts Setup
+# iOS Setup
 
-Three ways to get notifications on your iPhone, from easiest to most DIY.
+Three ways to get notifications, from simplest to most customizable. All use built-in iOS apps — nothing to install.
 
-## Option 1: ntfy.sh App (recommended)
+## Option 1: Mail VIP (recommended)
 
-The simplest path. Install once, scan QR, done.
+The simplest. One-time setup, instant push notifications.
 
-1. Install **ntfy** from the App Store
-2. Run `agent-notif qr` on your machine
-3. Scan the QR code or open the URL in Safari
-4. The ntfy app subscribes and delivers native push notifications
+1. Open **Mail** on iPhone
+2. Open any email from your notification sender (e.g. `admin@a-ndy.co`)
+3. Tap the sender name → **Add to VIP**
 
-That's it. The app handles everything — background delivery, notification grouping, priority levels.
+Done. VIP emails:
+- Show banner notifications on Lock Screen
+- Have their own notification sound (customizable in Settings → Notifications → Mail → VIP)
+- Can bypass Focus / Do Not Disturb (Settings → Focus → allow VIP mail)
+- Show in the VIP mailbox for quick review
 
-## Option 2: Polling Shortcut (no app)
+### Why this works
 
-If you don't want to install any app, you can use iOS Shortcuts to poll ntfy.sh periodically.
-
-### Create the Shortcut
-
-1. Open **Shortcuts** app
-2. Tap **+** to create new Shortcut
-3. Add these actions:
-
-**Step 1:** Get Contents of URL
+Every `notif` command sends an email with subject like:
 ```
-URL: https://ntfy.sh/YOUR_TOPIC/json?poll=1&since=5m
-Method: GET
+[notif] 🤖 claude: Refactor complete
 ```
 
-**Step 2:** Repeat with Each (from Step 1)
-- Inside the loop:
+iOS Mail delivers push notifications for VIP senders instantly. No polling, no third-party app, no API.
 
-**Step 3:** Get Dictionary Value
+## Option 2: Shortcuts Email Automation (more control)
+
+Triggers a Shortcut when a notification email arrives. Lets you customize what happens.
+
+1. Open **Shortcuts** → **Automation** tab
+2. Tap **+** → **Email**
+3. Set trigger:
+   - **Subject Contains**: `[notif]`
+   - (or **Sender Is**: your notification address)
+4. Add actions:
+   - **Show Notification**: use the email subject as the notification body
+5. Turn off **Ask Before Running**
+
+### Advanced: parse and route
+
+You can build more complex Shortcuts that:
+- Extract the source emoji from the subject to set notification category
+- Log notifications to a Notes document
+- Forward high-priority ones to a different alert sound
+- Trigger HomeKit scenes (e.g. flash a light when deploy finishes)
+
+Example Shortcut flow:
 ```
-Key: message
-Dictionary: Repeat Item
-```
-
-**Step 4:** Show Notification
-```
-Body: (Dictionary Value from Step 3)
-```
-
-### Set up Automation
-
-1. Go to **Automation** tab in Shortcuts
-2. Tap **+** → **Time of Day**
-3. Set to repeat every 5 minutes (or your preference)
-4. Action: Run your notification Shortcut
-5. Turn off "Ask Before Running"
-
-### Limitations
-
-- Minimum polling interval is ~5 minutes
-- Won't work if phone is in low power mode
-- Notifications are slightly delayed vs push
-
-## Option 3: Pushover (alternative transport)
-
-If you prefer Pushover over ntfy.sh:
-
-1. Install Pushover app ($4.99 one-time)
-2. Get your User Key from the app
-3. Register an API token at pushover.net
-4. Set environment variables:
-
-```bash
-export NOTIF_TRANSPORT=pushover
-export PUSHOVER_USER=your-user-key
-export PUSHOVER_TOKEN=your-app-token
+Email arrives with subject "[notif] ☁️ aws: Deploy finished"
+→ Get text from subject
+→ If subject contains "high" → Play critical alert sound
+→ Show Notification with parsed message
+→ Add row to "Notification Log" note
 ```
 
-(Pushover support is planned for a future release)
+## Option 3: Mail Rules + Shortcuts
 
-## Tips
+Use Mail rules on your Mac (or server-side Sieve rules) to:
+1. Move notification emails to a dedicated folder
+2. Mark them with a specific flag
+3. Trigger a Shortcut based on the flag
 
-- **Battery**: The ntfy.sh app uses Apple's push notification service, so it uses minimal battery. The polling Shortcut approach uses more.
-- **Privacy**: Your topic URL is a secret. Anyone who knows it can send you notifications. Keep it private.
-- **Multiple devices**: Just subscribe on each device. ntfy.sh delivers to all subscribers.
-- **Filtering**: In the ntfy app, you can mute specific topics or set Do Not Disturb schedules.
+This keeps your inbox clean while still getting push notifications.
+
+## Subject format
+
+All notifications use this subject format for easy filtering:
+
+```
+[notif] EMOJI SOURCE: MESSAGE
+```
+
+Examples:
+```
+[notif] 🤖 claude: Build complete — 12 files changed
+[notif] ☁️ aws: EC2 instance i-abc123 ready
+[notif] 🧠 lambda: Training epoch 50/100 done
+[notif] 🏠 home: Backup finished
+```
+
+The `[notif]` prefix makes it trivial to filter in any email client or Shortcut automation.
